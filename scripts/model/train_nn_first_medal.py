@@ -11,15 +11,18 @@ from tensorflow.keras.callbacks import EarlyStopping
 
 np.random.seed(42)
 
-DATA_PATH = Path(__file__).resolve().parent.parent.parent / "outputs" / "processed_data" / "cleaned_medal_data.csv"
-TEST_START_YEAR = 2016
+DATA_PATH = Path("cleaned_medal_data.csv")
+# Use a later split year to enlarge training set and leave only recent cycles for testing
+TEST_START_YEAR = 2020
+PROJECTED_2028_INPUT = Path("projected_2028_candidates.csv")
+PROJECTED_2028_PRED = Path("projected_2028_predictions.csv")
 
 def load_and_prepare():
     df = pd.read_csv(DATA_PATH)
     df = df.sort_values(["Year", "NOC"]).reset_index(drop=True)
 
     target_col = "Is_First_Medal"
-    feature_cols = ["Sport_Count", "Participants", "Prev_Year_Participation"]
+    feature_cols = ["Sport_Count", "Participants", "Prev_Year_Participation","Participation_Years_So_Far"]
     missing = [c for c in feature_cols + [target_col] if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns in data: {missing}")
@@ -47,7 +50,7 @@ def build_model(input_dim: int) -> keras.Model:
     model = keras.Sequential(
         [
             layers.Input(shape=(input_dim,)),
-            # [模型简化] 减少神经元数量、降低Dropout使模型更温和
+            # [Model simplification] Reduce neurons and lighten dropout for a gentler model
             layers.Dense(32, activation="relu"),  # ReLU mitigates vanishing gradients
             layers.Dense(16, activation="relu"),
             layers.Dropout(0.2),
@@ -76,12 +79,12 @@ def main():
     pos_count = int((y_train == 1).sum())
     neg_count = int((y_train == 0).sum())
     print(f"\nTraining class distribution -> 0: {neg_count}, 1: {pos_count}")
-    # [类别权重优化] 主动提升正例权重，但不提升过头（gentle boost）
-    class_weight = compute_gentle_boost_class_weight(y_train, alpha=0.4, max_pos_weight=1.65)
+    # [Class weight tuning] Gently boost positives without over-amplifying
+    class_weight = compute_gentle_boost_class_weight(y_train, alpha=0.4, max_pos_weight=1.25)
     print(f"Gentle-boost class_weight: {class_weight}")
 
     callbacks = [
-        # [早停策略] 优先保召回，放宽停止条件（更高patience、监控val_recall最大化）
+        # [Early stopping] Favor recall with higher patience and monitor val_recall maximization
         EarlyStopping(monitor="val_recall", mode="max", patience=8, min_delta=0.002, restore_best_weights=True),
     ]
 
@@ -121,7 +124,7 @@ def main():
     print("Confusion matrix (rows=true, cols=pred):")
     print(cm)
 
-    # [精细阈值搜索] 0.1到0.9、步长0.05，输出每个阈值的指标并筛选满足目标区间
+    # [Fine-grained threshold search] 0.1 to 0.9 step 0.05; report metrics and filter target range
     df_thr, best_thr, best_metrics, satisfied = sweep_thresholds(y_test, y_prob)
     print("\nThreshold metrics (full sweep):")
     print(df_thr.to_string(index=False))
@@ -175,7 +178,7 @@ def plot_training_curves(history: keras.callbacks.History) -> None:
     plt.close()
 
 def sweep_thresholds(y_true: np.ndarray, y_prob: np.ndarray):
-    # 阈值范围更细：0.1到0.9，步长0.05
+    # Finer threshold range: 0.1 to 0.9 with step 0.05
     thresholds = np.round(np.arange(0.1, 0.91, 0.05), 2)
     rows = []
     best_f1 = -1.0
@@ -208,14 +211,14 @@ def sweep_thresholds(y_true: np.ndarray, y_prob: np.ndarray):
 
 
 def compute_moderate_class_weight(y: np.ndarray, damping: float = 0.5, max_pos_weight: float = 2.0):
-    """根据balanced权重进行阻尼，得到温和类别权重。
-    - damping: 0~1之间，越小越温和；0表示不加权，1表示使用balanced原值。
-    - max_pos_weight: 对正例权重上限裁剪，避免过大导致精确率崩盘。
+    """Dampen balanced class weights for a gentler adjustment.
+    - damping: between 0 and 1; smaller is gentler. 0=no weighting, 1=use balanced value.
+    - max_pos_weight: cap positive weight to avoid precision collapse when too large.
     """
     classes = np.array([0, 1])
     balanced = compute_class_weight(class_weight="balanced", classes=classes, y=y)
     w0_bal, w1_bal = float(balanced[0]), float(balanced[1])
-    # 负类维持1.0，正类在1.0与balanced之间线性插值，然后裁剪到上限
+    # Keep negative at 1.0; interpolate positive between 1.0 and balanced then cap
     w0 = 1.0
     w1 = 1.0 + damping * (w1_bal - 1.0)
     w1 = float(min(max_pos_weight, max(1.0, w1)))
@@ -224,15 +227,15 @@ def compute_moderate_class_weight(y: np.ndarray, damping: float = 0.5, max_pos_w
 
 
 def compute_gentle_boost_class_weight(y: np.ndarray, alpha: float = 0.4, max_pos_weight: float = 2.5):
-    """主动提升正例权重，但不过度：
-    - 基于类别不平衡比(neg/pos)进行温和提升：w1 = 1 + alpha * (neg/pos - 1)
-    - 限制正例权重上限为max_pos_weight，负例始终为1.0
-    - alpha建议0.3~0.6，控制提升力度；max_pos_weight用于避免精确率崩盘。
+    """Gently boost positive class weight without overdoing it.
+    - Use class imbalance ratio (neg/pos): w1 = 1 + alpha * (neg/pos - 1)
+    - Cap positive weight at max_pos_weight; negative stays at 1.0
+    - Recommended alpha 0.3~0.6 to control strength; max_pos_weight prevents precision collapse.
     """
     neg = float((y == 0).sum())
     pos = float((y == 1).sum())
     if pos == 0:
-        # 防御：没有正例时不加权
+        # Guard: no positives, so no weighting
         return {0: 1.0, 1: 1.0}
     imbalance = neg / pos
     w1 = 1.0 + alpha * max(0.0, (imbalance - 1.0))
@@ -254,14 +257,29 @@ def project_2028_from_2024(df: pd.DataFrame) -> pd.DataFrame:
     return df_2028
 
 
+def load_projected_2028(feature_cols, df_all: pd.DataFrame, projected_path: Path = PROJECTED_2028_INPUT) -> pd.DataFrame:
+    """Load projected 2028 candidates from disk when available; otherwise fallback to projection."""
+    if projected_path.exists():
+        df_2028 = pd.read_csv(projected_path)
+        missing = [c for c in feature_cols + ["NOC", "Year"] if c not in df_2028.columns]
+        if missing:
+            raise ValueError(f"Projected 2028 file missing columns: {missing}")
+        return df_2028
+
+    print(f"[Inference] {projected_path} not found; projecting from 2024 participation instead.")
+    return project_2028_from_2024(df_all)
+
+
 def predict_projected_2028(
     model: keras.Model,
     scaler: StandardScaler,
     feature_cols,
     df_all: pd.DataFrame,
     prob_threshold: float = 0.5,
+    projected_path: Path = PROJECTED_2028_INPUT,
+    save_path: Path = PROJECTED_2028_PRED,
 ):
-    df_2028 = project_2028_from_2024(df_all)
+    df_2028 = load_projected_2028(feature_cols, df_all, projected_path)
     if df_2028.empty:
         print("\n[Inference] No projected 2028 rows (from 2024 never-medal participants).")
         return
@@ -279,6 +297,9 @@ def predict_projected_2028(
 
     print("\n[Inference] Projected 2028 first-medal probabilities (never-medal countries, based on 2024 participation):")
     print(top20.to_string(index=False, formatters={"prob": lambda x: f"{x:.4f}"}))
+
+    ranked.to_csv(save_path, index=False)
+    print(f"[Inference] Full 2028 prediction results saved to: {save_path.resolve()}")
 
 
 if __name__ == "__main__":
